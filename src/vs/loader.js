@@ -53,9 +53,7 @@ var AMDLoader;
 			this._isElectronNodeIntegrationWebWorker = false;
 		}
 		_detect() {
-			if (this._detected) {
-				return;
-			}
+			if (this._detected) return;
 			this._detected = true;
 			this._isWindows = Environment._isWindows();
 			this._isNode = (typeof module !== 'undefined' && !!module.exports);
