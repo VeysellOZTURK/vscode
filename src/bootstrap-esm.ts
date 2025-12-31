@@ -1,112 +1,120 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Microsoft Corporation. All rights reserved.
- *  Licensed under the MIT License. See License.txt in the project root for license information.
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
  *--------------------------------------------------------------------------------------------*/
 
 import * as fs from 'node:fs';
 import { register } from 'node:module';
 import { product, pkg } from './bootstrap-meta.js';
 import './bootstrap-node.js';
-import * as performance from './vs/base/common/performance.js';
+import * as perf from './vs/base/common/performance.js';
 import { INLSConfiguration } from './vs/nls.js';
 
-// Install a hook to module resolution to map 'fs' to 'original-fs'
-if (process.env['ELECTRON_RUN_AS_NODE'] || process.versions['electron']) {
-	const jsCode = `
-	export async function resolve(specifier, context, nextResolve) {
-		if (specifier === 'fs') {
-			return {
-				format: 'builtin',
-				shortCircuit: true,
-				url: 'node:original-fs'
-			};
-		}
+/* ---------------------------------- ESM FS Hook ---------------------------------- */
 
-		// Defer to the next hook in the chain, which would be the
-		// Node.js default resolve if this is the last user-specified loader.
-		return nextResolve(specifier, context);
-	}`;
-	register(`data:text/javascript;base64,${Buffer.from(jsCode).toString('base64')}`, import.meta.url);
-}
+const isElectron =
+	process.env.ELECTRON_RUN_AS_NODE || process.versions.electron;
 
-// Prepare globals that are needed for running
-globalThis._VSCODE_PRODUCT_JSON = { ...product };
-globalThis._VSCODE_PACKAGE_JSON = { ...pkg };
-globalThis._VSCODE_FILE_ROOT = import.meta.dirname;
-
-//#region NLS helpers
-
-let setupNLSResult: Promise<INLSConfiguration | undefined> | undefined = undefined;
-
-function setupNLS(): Promise<INLSConfiguration | undefined> {
-	if (!setupNLSResult) {
-		setupNLSResult = doSetupNLS();
-	}
-
-	return setupNLSResult;
-}
-
-async function doSetupNLS(): Promise<INLSConfiguration | undefined> {
-	performance.mark('code/willLoadNls');
-
-	let nlsConfig: INLSConfiguration | undefined = undefined;
-
-	let messagesFile: string | undefined;
-	if (process.env['VSCODE_NLS_CONFIG']) {
-		try {
-			nlsConfig = JSON.parse(process.env['VSCODE_NLS_CONFIG']);
-			if (nlsConfig?.languagePack?.messagesFile) {
-				messagesFile = nlsConfig.languagePack.messagesFile;
-			} else if (nlsConfig?.defaultMessagesFile) {
-				messagesFile = nlsConfig.defaultMessagesFile;
+if (isElectron) {
+	const loader = `
+		export async function resolve(specifier, ctx, next) {
+			if (specifier === 'fs') {
+				return {
+					format: 'builtin',
+					shortCircuit: true,
+					url: 'node:original-fs'
+				};
 			}
-
-			globalThis._VSCODE_NLS_LANGUAGE = nlsConfig?.resolvedLanguage;
-		} catch (e) {
-			console.error(`Error reading VSCODE_NLS_CONFIG from environment: ${e}`);
+			return next(specifier, ctx);
 		}
-	}
+	`;
 
-	if (
-		process.env['VSCODE_DEV'] ||	// no NLS support in dev mode
-		!messagesFile					// no NLS messages file
-	) {
-		return undefined;
-	}
+	register(
+		`data:text/javascript;base64,${Buffer.from(loader).toString('base64')}`,
+		import.meta.url
+	);
+}
+
+/* ---------------------------------- Globals ---------------------------------- */
+
+Object.assign(globalThis, {
+	_VSCODE_PRODUCT_JSON: { ...product },
+	_VSCODE_PACKAGE_JSON: { ...pkg },
+	_VSCODE_FILE_ROOT: import.meta.dirname
+});
+
+/* ---------------------------------- NLS ---------------------------------- */
+
+let nlsSetup: Promise<INLSConfiguration | undefined> | undefined;
+
+const setupNLS = () => nlsSetup ??= loadNLS();
+
+async function loadNLS(): Promise<INLSConfiguration | undefined> {
+	perf.mark('code/willLoadNls');
+
+	const env = process.env.VSCODE_NLS_CONFIG;
+	if (!env || process.env.VSCODE_DEV) return;
+
+	let config: INLSConfiguration | undefined;
+	let messagesFile: string | undefined;
 
 	try {
-		globalThis._VSCODE_NLS_MESSAGES = JSON.parse((await fs.promises.readFile(messagesFile)).toString());
-	} catch (error) {
-		console.error(`Error reading NLS messages file ${messagesFile}: ${error}`);
+		config = JSON.parse(env);
+		messagesFile =
+			config?.languagePack?.messagesFile ??
+			config?.defaultMessagesFile;
 
-		// Mark as corrupt: this will re-create the language pack cache next startup
-		if (nlsConfig?.languagePack?.corruptMarkerFile) {
-			try {
-				await fs.promises.writeFile(nlsConfig.languagePack.corruptMarkerFile, 'corrupted');
-			} catch (error) {
-				console.error(`Error writing corrupted NLS marker file: ${error}`);
-			}
-		}
-
-		// Fallback to the default message file to ensure english translation at least
-		if (nlsConfig?.defaultMessagesFile && nlsConfig.defaultMessagesFile !== messagesFile) {
-			try {
-				globalThis._VSCODE_NLS_MESSAGES = JSON.parse((await fs.promises.readFile(nlsConfig.defaultMessagesFile)).toString());
-			} catch (error) {
-				console.error(`Error reading default NLS messages file ${nlsConfig.defaultMessagesFile}: ${error}`);
-			}
-		}
+		globalThis._VSCODE_NLS_LANGUAGE = config?.resolvedLanguage;
+	} catch (e) {
+		console.error('Invalid VSCODE_NLS_CONFIG:', e);
+		return;
 	}
 
-	performance.mark('code/didLoadNls');
+	if (!messagesFile) return;
 
-	return nlsConfig;
+	try {
+		globalThis._VSCODE_NLS_MESSAGES = JSON.parse(
+			await fs.promises.readFile(messagesFile, 'utf8')
+		);
+	} catch (e) {
+		console.error(`NLS read error: ${messagesFile}`, e);
+		await markCorrupt(config);
+		await fallbackToDefault(config, messagesFile);
+	}
+
+	perf.mark('code/didLoadNls');
+	return config;
 }
 
-//#endregion
+async function markCorrupt(config?: INLSConfiguration) {
+	const file = config?.languagePack?.corruptMarkerFile;
+	if (!file) return;
+
+	try {
+		await fs.promises.writeFile(file, 'corrupted');
+	} catch (e) {
+		console.error('Corrupt marker write failed:', e);
+	}
+}
+
+async function fallbackToDefault(
+	config?: INLSConfiguration,
+	current?: string
+) {
+	const fallback = config?.defaultMessagesFile;
+	if (!fallback || fallback === current) return;
+
+	try {
+		globalThis._VSCODE_NLS_MESSAGES = JSON.parse(
+			await fs.promises.readFile(fallback, 'utf8')
+		);
+	} catch (e) {
+		console.error(`Default NLS read error: ${fallback}`, e);
+	}
+}
+
+/* ---------------------------------- Bootstrap ---------------------------------- */
 
 export async function bootstrapESM(): Promise<void> {
-
-	// NLS
 	await setupNLS();
 }
